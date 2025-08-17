@@ -1,0 +1,501 @@
+setwd("***********/BULK/general_process")#改成你自己的
+
+library(data.table)
+library(biomaRt)
+library(dplyr)
+library(ggpubr)
+library(purrr) 
+library(stringr)
+library(ggplot2)
+library(tidyr)
+library(ggrepel)
+library(limma)
+library(rstatix)
+library(DescTools)
+library(survival)
+library(broom)
+library(survminer)
+
+#install.packages("DescTools")
+
+
+#save.image("2.RData")
+
+#读取数据
+clinical  <- fread("TCGA-KIRC.clinical.tsv.gz")
+cnv      <- fread("TCGA-KIRC.masked_cnv_DNAcopy.tsv.gz")
+counts   <- fread("TCGA-KIRC.star_counts.tsv.gz")
+tpm   <- fread("TCGA-KIRC.star_tpm.tsv.gz")
+survival  <- fread("TCGA-KIRC.survival.tsv.gz")
+
+# 查看前几行数据
+head(clinical)
+head(cnv)
+head(counts)
+head(tpm)
+head(survival)
+
+
+#我们先来标准化数据格式，行为sample，列为gene
+
+
+#去掉版本号
+counts$ensembl_gene_id <- sub("\\..*", "", counts$Ensembl_ID)
+
+
+# biomaRt 映射（也可换 org.Hs.eg.db，见下方备注）
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = counts$ensembl_gene_id,
+  mart       = mart
+)
+# 仅保留成功映射（有非空 symbol）的 Ensembl
+map_ok <- map |>
+  filter(!is.na(hgnc_symbol), hgnc_symbol != "") |>
+  distinct(ensembl_gene_id, .keep_all = TRUE)   # 每个 Ensembl 只保留一条
+
+# 连接并替换基因名；只保留样本列 + symbol
+expr_cols <- setdiff(colnames(counts), c("Ensembl_ID", "ensembl_gene_id"))
+counts_sym <- counts |>
+  inner_join(map_ok, by = "ensembl_gene_id") |>
+  select(hgnc_symbol, all_of(expr_cols))        # 第一列是基因 symbol
+
+# 同名基因去重（同一 symbol 多行时聚合；这里用均值）
+counts_sym <- counts_sym |>
+  group_by(hgnc_symbol) |>
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+#行为sample，列为gene
+gene_names <- counts_sym$hgnc_symbol
+
+counts_sym$hgnc_symbol <- NULL
+
+sample_id <- colnames(counts_sym)
+
+counts_sym<- as.data.frame(t(counts_sym))
+
+colnames(counts_sym)<-gene_names
+
+counts_sym <- cbind(sample = sample_id, counts_sym)
+
+#到这个时候我们已经完成了counts的标准化，可用来DEGs分析
+#我们将其保存为RDS文件
+saveRDS(counts_sym,file = "counts.rds")
+
+
+#因为TPM与counts类似，所以我就投机取巧一下----------------------------------------
+
+
+#去掉版本号
+
+tpm$ensembl_gene_id <- sub("\\..*", "", tpm$Ensembl_ID)
+
+
+# biomaRt 映射（也可换 org.Hs.eg.db，见下方备注）
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+map <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = tpm$ensembl_gene_id,
+  mart       = mart
+)
+# 仅保留成功映射（有非空 symbol）的 Ensembl
+map_ok <- map |>
+  filter(!is.na(hgnc_symbol), hgnc_symbol != "") |>
+  distinct(ensembl_gene_id, .keep_all = TRUE)   # 每个 Ensembl 只保留一条
+
+# 连接并替换基因名；只保留样本列 + symbol
+expr_cols <- setdiff(colnames(tpm), c("Ensembl_ID", "ensembl_gene_id"))
+tpm_sym <- tpm |>
+  inner_join(map_ok, by = "ensembl_gene_id") |>
+  select(hgnc_symbol, all_of(expr_cols))        # 第一列是基因 symbol
+
+# 同名基因去重（同一 symbol 多行时聚合；这里用均值）
+tpm_sym <- tpm_sym |>
+  group_by(hgnc_symbol) |>
+  summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+#行为sample，列为gene
+gene_names <- tpm_sym$hgnc_symbol
+
+tpm_sym$hgnc_symbol <- NULL
+
+sample_id <- colnames(tpm_sym)
+
+tpm_sym<- as.data.frame(t(tpm_sym))
+
+colnames(tpm_sym)<-gene_names
+
+tpm_sym <- cbind(sample = sample_id, tpm_sym)
+
+saveRDS(tpm_sym,file = "tpm.rds")
+
+#取出共同的sample：survival、clinical、counts
+
+# 找出三者的共同样本 ID
+common_samples <- Reduce(intersect, list(
+  survival$sample,
+  clinical$sample,
+  counts_sym$sample,
+  tpm_sym$sample
+))
+
+# 分别过滤三个表
+survival_sub <- survival[survival$sample %in% common_samples, ]
+clinical_sub <- clinical[clinical$sample %in% common_samples, ]
+counts_sub   <- counts_sym[counts_sym$sample %in% common_samples, ]
+tpm_sub   <- tpm_sym[tpm_sym$sample %in% common_samples, ]
+
+# 结果检查
+length(common_samples)
+head(common_samples)
+
+merged_tpm <- list(survival_sub, clinical_sub, tpm_sub) %>%
+             reduce(full_join, by = "sample")
+merged_counts <- list(survival_sub, clinical_sub, counts_sub) %>%
+  reduce(full_join, by = "sample")
+# 查看结果
+dim(merged_tpm)
+head(merged_tpm[, 1:8])
+
+saveRDS(merged_tpm,file="merged_tpm.rds")
+saveRDS(merged_counts,file="merged_counts.rds")
+#save.image("3.RData")
+
+#我们用于主流程分析的数据已经准备好了，下面开始进行一些通用的分析----------------
+
+clinical_sub <- clinical_sub %>%
+  mutate(sample_type = str_sub(sample, 14, 15),   # 取第14-15位字符
+         sample_type = case_when(
+           sample_type == "01" ~ "Tumor",
+           sample_type == "11" ~ "Normal",
+           TRUE ~ "Other"   # 其他类型先归为 Other，可以后续过滤
+         ))
+clinical_sub <- clinical_sub %>% filter(sample_type %in% c("Tumor", "Normal"))
+#part1-----差异表达分析--------
+## 0) 准备分组（确保只有 Tumor/Normal）
+meta <- clinical_sub %>%
+  select(sample, sample_type) %>%
+  filter(sample_type %in% c("Tumor","Normal")) %>%
+  mutate(condition = factor(sample_type, levels = c("Normal","Tumor")))
+
+## 1) 取表达矩阵（已是 log2(count+1)）
+expr <- counts_sub
+rownames(expr) <- expr$sample
+expr$sample <- NULL
+
+# 确保是数值矩阵
+expr <- as.data.frame(expr)
+expr[] <- lapply(expr, function(x) as.numeric(as.character(x)))
+expr <- as.matrix(expr)
+
+## 2) 样本对齐
+common <- intersect(rownames(expr), meta$sample)
+expr <- expr[common, , drop = FALSE]    # 样本×基因
+meta <- meta[match(common, meta$sample), , drop = FALSE]
+
+## 3) 过滤极低变异基因（可选但推荐）
+# 低变异基因对统计没有贡献，还会增加多重校正负担
+v <- apply(expr, 2, var, na.rm = TRUE)
+expr <- expr[, v > 1e-6, drop = FALSE]
+
+## 4) 设计矩阵（两组比较：Tumor vs Normal）
+design <- model.matrix(~ condition, data = meta)
+# 列名通常是 "(Intercept)" 和 "conditionTumor"
+colnames(design)
+
+## 5) 拟合线性模型 + 贝叶斯收缩
+# 注意：limma 期望“行=基因，列=样本”，所以对 expr 转置
+fit <- lmFit(t(expr), design)
+fit <- eBayes(fit)
+
+## 6) 取对比：Tumor - Normal 的系数
+# 直接取系数 "conditionTumor"（默认就是 Tumor 相对 Normal）
+res <- topTable(fit, coef = "conditionTumor", number = Inf, sort.by = "P")
+# res 列包括：logFC, AveExpr, t, P.Value, adj.P.Val, B
+res$gene <- rownames(res)
+
+## 7) 画火山图并高亮 KRT81
+gene_of_interest <- "KRT81"
+lfc_thr  <- 1
+fdr_thr  <- 0.05
+
+res$Sig <- "NS"
+res$Sig[res$adj.P.Val < fdr_thr & res$logFC >  lfc_thr] <- "Up"
+res$Sig[res$adj.P.Val < fdr_thr & res$logFC < -lfc_thr] <- "Down"
+
+p_vol <- ggplot(res, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = Sig), alpha = 0.7, size = 1.3) +
+  scale_color_manual(values = c(Up = "#CB181D", Down = "#2171B5", NS = "grey70")) +
+  geom_vline(xintercept = c(-lfc_thr, lfc_thr), linetype = 2, linewidth = 0.4) +
+  geom_hline(yintercept = -log10(fdr_thr), linetype = 2, linewidth = 0.4) +
+  # 高亮 KRT81
+  geom_point(data = subset(res, gene == gene_of_interest),
+             shape = 21, size = 3, stroke = 0.8, fill = "gold", color = "black") +
+  geom_text_repel(
+    data = subset(res, gene == gene_of_interest),
+    aes(label = paste0(gene, "\nlog2FC=", round(logFC, 2),
+                       ", FDR=", signif(adj.P.Val, 3))),
+    size = 3.5, box.padding = 0.35, point.padding = 0.3, max.overlaps = Inf
+  ) +
+  labs(title = "Volcano plot on log2(count+1) (Tumor vs Normal)",
+       x = "log2FC (Tumor - Normal) on log2(count+1)",
+       y = "-log10(FDR)", color = NULL) +
+  theme_bw(base_size = 13)
+
+print(p_vol)
+
+## 8) 结果表（按 FDR 排序）
+res_out <- res %>% arrange(adj.P.Val)
+head(res_out[, c("gene","logFC","P.Value","adj.P.Val")])
+
+
+
+
+
+#part2-----成对样本分析--------
+#使用tpm数据
+#写一个用于配对的函数
+parse_tcga <- function(v) {
+  tibble(
+    sample      = v,
+    patient_id  = str_extract(v, "^[^-]+-[^-]+-[^-]+"),  # TCGA-XX-XXXX
+    sample_code = str_match(v, "-(\\d{2})[A-Z]")[,2]     # 取第三个'-'后的两位数字
+  )
+}
+
+# 把你的样本列丢进来
+meta <- parse_tcga(merged_tpm$sample)
+
+# 只保留我们关心的 01(肿瘤) 和 11(癌旁)
+meta2 <- meta %>% filter(sample_code %in% c("01", "11"))
+
+# 找到能配成对的病人（既有 01 又有 11）
+paired_patients <- meta2 %>%
+  group_by(patient_id) %>%
+  filter(all(c("01","11") %in% sample_code)) %>%
+  ungroup()
+
+# 为每位病人各取一个 01 和 11（若有多个，取第一个；也可改为取TPM最大的等）
+pair_table <- paired_patients %>%
+  group_by(patient_id) %>%
+  summarise(
+    tumor_sample  = sample[sample_code == "01"][1],
+    normal_sample = sample[sample_code == "11"][1],
+    .groups = "drop"
+  )
+
+#下面我们成对分析某一个基因，比如KRT81基因
+
+
+plot_paired_gene <- function(tpm_sub, pair_table, gene) {
+  stopifnot("sample" %in% colnames(tpm_sub))
+  if (!gene %in% colnames(tpm_sub)) {
+    stop(sprintf("未在 tpm_sub 的列名中找到基因：%s", gene))
+  }
+  
+  # 取出肿瘤/癌旁表达，按 pair_table 对齐（每病人各取一个01和11）
+  tumor_df <- tpm_sub %>%
+    select(sample, !!gene) %>%
+    inner_join(select(pair_table, patient_id, tumor_sample),
+               by = c("sample" = "tumor_sample")) %>%
+    rename(tumor_expr = !!gene)
+  
+  normal_df <- tpm_sub %>%
+    select(sample, !!gene) %>%
+    inner_join(select(pair_table, patient_id, normal_sample),
+               by = c("sample" = "normal_sample")) %>%
+    rename(normal_expr = !!gene)
+  
+  paired_expr <- inner_join(tumor_df, normal_df, by = "patient_id") %>%
+    select(patient_id, tumor_expr, normal_expr)
+  
+  # 统计检验（配对）
+  ttest_p  <- t.test(paired_expr$tumor_expr, paired_expr$normal_expr, paired = TRUE)$p.value
+  wilcx_p  <- wilcox.test(paired_expr$tumor_expr, paired_expr$normal_expr, paired = TRUE)$p.value
+  p_lab <- paste0("paired t-test p = ", signif(ttest_p, 3),
+                  "\nWilcoxon p = ",   signif(wilcx_p, 3))
+  
+  # 整理长表用于作图
+  plot_df <- paired_expr %>%
+    pivot_longer(c(tumor_expr, normal_expr),
+                 names_to = "group", values_to = "expr") %>%
+    mutate(group = factor(group,
+                          levels = c("normal_expr", "tumor_expr"),
+                          labels = c("Normal(11)", "Tumor(01)")))
+  
+  y_max <- max(plot_df$expr, na.rm = TRUE)
+  
+  # 颜色：淡蓝、暗红
+  cols <- c("Normal(11)" = "#9ECAE1", "Tumor(01)" = "#CB181D")
+  
+  p <- ggplot(plot_df, aes(x = group, y = expr)) +
+    # 成对连线（每位病人一条线）
+    geom_line(aes(group = patient_id), color = "grey60", alpha = 0.5) +
+    geom_point(size = 1.5, alpha = 0.3) +
+    # 箱线图
+    geom_boxplot(aes(fill = group), alpha = 0.35, width = 0.5, outlier.shape = NA) +
+    scale_fill_manual(values = cols, guide = "none") +
+    labs(title = paste0(gene, " paired expression (Tumor vs Normal)"),
+         x = NULL, y = "Expression (TPM)") +
+    theme_bw(base_size = 14) +
+    theme(panel.grid.major.x = element_blank(),
+          axis.text.x = element_text(size = 12, face = "bold"))
+  
+  # 简单的括号 + 文本显著性标注
+  p <- p +
+    annotate("segment", x = 1, xend = 2, y = y_max * 1.06, yend = y_max * 1.06, size = 0.6) +
+    annotate("segment", x = 1, xend = 1, y = y_max * 1.02, yend = y_max * 1.06, size = 0.6) +
+    annotate("segment", x = 2, xend = 2, y = y_max * 1.02, yend = y_max * 1.06, size = 0.6) +
+    annotate("text", x = 1.5, y = y_max * 1.09, label = p_lab, size = 4.2)
+  
+  print(p)
+  
+  invisible(list(plot = p, stats = list(t_p = ttest_p, wilcox_p = wilcx_p)))
+}
+
+#使用这个函数
+res <- plot_paired_gene(tpm_sub, pair_table, "KRT81")
+
+#save.image("4.RData")
+
+#----------------下面我们分析该基因与一些临床指标之间关系-----------------------
+
+df <- merged_tpm
+
+#取 KRT81 表达
+# 宽表：存在一列名为 "KRT81"
+
+df <- df %>% mutate(expr_TPM = as.numeric(KRT81))
+
+df <- df %>% mutate(expr = log2(expr_TPM + 1))
+
+## ===== 2) 清洗 AJCC 分期到 I/II/III/IV
+stage_candidates <- c(
+  "ajcc_pathologic_stage.diagnoses"
+)
+#注意核查每份数据的命名可能不一样
+st_col <- stage_candidates[stage_candidates %in% names(df)][1]
+if (is.na(st_col)) stop("没找到病理分期列；请检查 merged_tpm 的列名。")
+
+table(merged_tpm$ajcc_pathologic_stage.diagnoses)#打印出来看一下
+
+clean_stage <- function(x){
+  x <- toupper(as.character(x))
+  x <- stringr::str_replace_all(x, "STAGE\\s*", "")
+  x <- stringr::str_replace_all(x, "\\s+", "")
+  x <- stringr::str_replace_all(x, "(A|B|C)$", "")  # 折叠子分期
+  x[!(x %in% c("I","II","III","IV"))] <- NA
+  factor(x, levels=c("I","II","III","IV"), ordered=TRUE)
+}
+
+df <- df %>%
+  mutate(stage_raw = .data[[st_col]],
+         stage = clean_stage(stage_raw)) %>%
+  filter(!is.na(stage), !is.na(expr))
+
+cat("各分期样本量：\n"); print(table(df$stage))
+
+## ===== 3) 统计检验 =====
+# 3.1 Kruskal–Wallis 总体差异
+kw <- rstatix::kruskal_test(expr ~ stage, data=df)
+
+# 3.2 Dunn 事后比较（BH 校正）
+dunn <- rstatix::dunn_test(expr ~ stage, data=df, p.adjust.method="BH") %>%
+  dplyr::arrange(p.adj)
+
+# 3.3 单调趋势：Jonckheere–Terpstra
+jt  <- DescTools::JonckheereTerpstraTest(df$expr, df$stage, alternative="two.sided")
+
+cat("\nKruskal–Wallis 结果：\n"); print(kw)
+cat("\nDunn 事后比较（BH 校正）前几项：\n"); print(head(dunn, 10))
+cat("\nJonckheere–Terpstra 趋势检验：\n"); print(jt)
+
+## ===== 4) 可视化 =====
+set.seed(1)
+p <- ggplot(df, aes(stage, expr)) +
+  geom_boxplot(outlier.shape = NA, width = .6) +
+  geom_jitter(width = .15, alpha = .5, size = 1) +
+  labs(x = "AJCC 病理分期 (I–IV)",
+       y = "KRT81 expression  [log2(TPM+1)]",
+       title = "KRT81 在不同病理分期的表达分布") +
+  theme_bw(base_size = 12)
+
+# 叠加总体 Kruskal 显著性；两两比较用 Wilcoxon 作图标注（Dunn 结果请看表格输出）
+y_top <- max(df$expr, na.rm=TRUE)
+p +
+  ggpubr::stat_compare_means(method = "kruskal.test", label.y = y_top * 1.05) +
+  ggpubr::stat_compare_means(comparisons = list(c("I","II"), c("II","III"), c("III","IV"),
+                                                c("I","III"), c("I","IV"), c("II","IV")),
+                             method = "wilcox.test",
+                             label = "p.signif", hide.ns = TRUE)
+
+#-------------我们再分析一下该基因的预后，（kp生存曲线与cox回归）--------------------
+df <- merged_tpm
+
+df <- df %>% mutate(expr = log2(as.numeric(KRT81) + 1))
+
+df <- df %>% group_by(`_PATIENT`) %>% slice_max(order_by = (stringr::str_detect(sample,"-01[A-Z]$")), with_ties = FALSE) %>% ungroup()
+
+dat <- df %>%
+  mutate(
+    time = suppressWarnings(as.numeric(OS.time)),
+    event = suppressWarnings(as.numeric(OS))
+  ) %>%
+  filter(!is.na(time), !is.na(event), !is.na(expr)) %>%
+  mutate(time = pmax(time, 1))     # 避免 0
+
+## 3) 单因素 Cox（连续表达）
+fit_uni <- coxph(Surv(time, event) ~ expr, data = dat)
+print(summary(fit_uni))
+
+# 整理 HR(95%CI) + P
+uni_res <- tidy(fit_uni, exponentiate = TRUE, conf.int = TRUE) %>%
+  select(term, estimate, conf.low, conf.high, p.value) %>%
+  rename(HR = estimate, CI_low = conf.low, CI_high = conf.high, P = p.value)
+print(uni_res)
+
+print(cox.zph(fit_uni))
+
+#可视化的图可以自己画一下
+
+df <- merged_tpm
+
+df <- df %>% mutate(expr = log2(as.numeric(KRT81) + 1))
+
+dat <- df %>%
+  transmute(
+    time  = pmax(as.numeric(OS.time), 1),
+    event = as.numeric(OS),
+    expr  = expr
+  ) %>% filter(!is.na(time), !is.na(event), !is.na(expr))
+
+## --- A. 按中位数分组绘制 KM 
+dat$group_median <- ifelse(dat$expr >= median(dat$expr, na.rm=TRUE), "High", "Low") |> factor()
+fit_km_med <- survfit(Surv(time, event) ~ group_median, data = dat)
+p1 <- ggsurvplot(
+  fit_km_med, data = dat, risk.table = TRUE, pval = TRUE, conf.int = FALSE,
+  xlab = "Time (days)", legend.title = "KRT81 (median split)",
+  legend.labs = c("High","Low")
+)
+print(p1)
+
+## --- B. 按最优切点（maxstat）分组绘制 KM（可选）
+res.cut <- surv_cutpoint(dat, time = "time", event = "event",
+                         variables = "expr", minprop = 0.2)
+
+cut_val <- as.numeric(res.cut$cutpoint$cutpoint)
+cat("Optimal cutpoint:", round(cut_val, 3), "\n")
+
+#将表达按最优切点分组
+res.cat <- surv_categorize(res.cut, variables = "expr")  # expr -> factor(low/high)
+table(res.cat$expr)  # 检查两组人数
+
+#KM 曲线
+fit_km_opt <- survfit(Surv(time, event) ~ expr, data = res.cat)
+ggsurvplot(fit_km_opt, data = res.cat, risk.table = TRUE, pval = TRUE,
+           xlab = "Time (days)", legend.title = "KRT81 (optimal cut)",
+           legend.labs = c("High","Low"))
+
