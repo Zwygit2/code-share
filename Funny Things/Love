@@ -1,0 +1,58 @@
+install.packages("plot3D")
+library(plot3D)
+
+# 预处理
+x <- seq(0, 24) / 24
+t <- seq(0, 575, by = 0.5) / 575 * 20 * pi + 4 * pi
+grid <- expand.grid(x = x, t = t)
+x <- matrix(grid$x, ncol = 25, byrow = TRUE)
+t <- matrix(grid$t, ncol = 25, byrow = TRUE)
+p <- (pi / 2) * exp(-t / (8 * pi))
+change <- sin(15 * t) / 150
+u <- 1 - (1 - (3.6 * t) %% (2 * pi) / pi)^4 / 2 + change
+y <- 2 * (x^2 - x)^2 * sin(p)
+r <- u * (x * sin(p) + y * cos(p))
+
+# ✅ 打开大窗口（RStudio/Windows 下）
+dev.new(width = 18, height = 16)
+
+
+
+persp3D(
+  x = r * cos(t),
+  y = r * sin(t),
+  z = u * (x * cos(p) - y * sin(p)),
+  main = NULL,  # ❗取消默认标题
+  xlab = "You",
+  ylab = "Love",
+  zlab = "I",
+  col = colorRampPalette(c("#EFD5DB", "#E3B3BB", "#D8929C", "#C47B91", "#8F476D"))(100),
+  border = NA,
+  box = FALSE,
+  colkey = FALSE,
+  ticktype = "detailed",
+  bty = "n",
+  theta = -60,
+  phi = 45
+)
+
+# 2. 自定义两行主标题
+title(
+  main = expression(paste("\U1F497","    My Love ", "\U1F497")),  # 第一行文字+emoji
+  line = 3,     # 离图上方的距离（数字越大越远）
+  col.main = "#D8929C",  # 第一行字体颜色
+  font.main = 2,          # 第一行字体加粗
+  cex.main = 2            # 第一行字体大小（标准1，这里2倍）
+)
+
+title(
+  main = " 写名字 ",    # 第二行文字
+  line = 0.5,             # 第二行位置，比上面小一点，靠近
+  col.main = "#D8929C",     # 第二行颜色
+  font.main = 2,          # 第二行字体加粗
+  cex.main = 1.8          # 第二行字体大小
+)
+
+t <- seq(0, 2 * pi, length.out = 300)
+hx <- 0.35 * 16 * sin(t)^3
+hy <- 0.35 * (13 * cos(t) - 5*cos(2*t) - 2*cos(3*t) - cos(4*t)) + 0.2
