@@ -1,0 +1,449 @@
+setwd("你自己的目录")
+
+# 加载必要的包
+library(Seurat)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(harmony)
+library(DoubletFinder)  # 新增：用于去除双细胞
+
+# 解压第一个文件（对照组）
+#unzip("filtered_feature_bc_matrix_ctl.zip", 
+#      exdir = "filtered_feature_bc_matrix_ctl")
+
+# 解压第二个文件（实验组）
+#unzip("filtered_feature_bc_matrix.zip", 
+#      exdir = "filtered_feature_bc_matrix")
+
+# 查看解压后的文件结构
+#list.files("filtered_feature_bc_matrix_ctl", recursive = TRUE)
+#list.files("filtered_feature_bc_matrix", recursive = TRUE)
+
+# 解压文件
+#unzip("filtered_feature_bc_matrix_ctl.zip", exdir = ".")
+#unzip("filtered_feature_bc_matrix.zip", exdir = ".")
+
+
+#我选择了两种类型的数据（类似于癌症癌旁）
+#后面会合并两种数据，我建议出初学者可以使用张泽民院士的2022年肝癌（CELL杂志）的单细胞数据练手
+
+
+# 读取单细胞数据（假设是10X Genomics格式）
+# 对照组
+ctl_data <- Read10X(data.dir = "filtered_feature_bc_matrix_ctl")
+ctl_seurat <- CreateSeuratObject(counts = ctl_data, 
+                                 project = "Control",
+                                 min.cells = 3, 
+                                 min.features = 200)
+
+# 实验组  
+exp_data <- Read10X(data.dir = "filtered_feature_bc_matrix")
+exp_seurat <- CreateSeuratObject(counts = exp_data, 
+                                 project = "Experiment",
+                                 min.cells = 3, 
+                                 min.features = 200)
+
+# 添加分组信息
+ctl_seurat$group <- "Control"
+exp_seurat$group <- "Experiment"
+
+# 合并数据（如果需要）
+combined <- merge(ctl_seurat, y = exp_seurat, 
+                  add.cell.ids = c("CTL", "EXP"), 
+                  project = "Combined_Analysis")
+
+# 计算线粒体基因比例
+combined[["percent.mt"]] <- PercentageFeatureSet(combined, pattern = "^MT-")
+
+# 可视化QC指标
+# 小提琴图（一般不需要透明度，保持不变）
+p1 <- VlnPlot(combined, 
+              features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+              ncol = 3, group.by = "group", pt.size = 0.02)
+
+# 散点图（添加透明度）
+p2 <- FeatureScatter(combined, feature1 = "nCount_RNA", feature2 = "percent.mt", 
+                     group.by = "group") 
+
+p3 <- FeatureScatter(combined, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", 
+                     group.by = "group") 
+
+# 显示图形
+print(p1)
+print(p2 + p3)
+
+# 保存QC图
+ggsave("QC_violin_plots.pdf", plot = p1, width = 12, height = 4)
+ggsave("feature_plot1.pdf", plot = p2, width = 8, height = 6)
+ggsave("feature_plot2.pdf", plot = p3, width = 8, height = 6)
+
+# 根据QC图结果调整阈值（初步过滤）
+combined <- subset(combined, subset = 
+                     nFeature_RNA > 200 &          # 最少检测到的基因数
+                     nFeature_RNA < 6000 &         # 最多检测到的基因数（去除双细胞）
+                     nCount_RNA < 30000 &          # UMI总数上限
+                     percent.mt < 20               # 线粒体基因比例上限
+)
+
+# 查看过滤后的细胞数
+print(paste("初步过滤后细胞数:", ncol(combined)))
+table(combined$group)
+
+# ===========================================
+# 新增：DoubletFinder 去除双细胞
+# ===========================================
+
+
+
+# 为了使用DoubletFinder，需要对每个样本单独处理
+# 分离两个样本
+ctl_cells <- WhichCells(combined, expression = group == "Control")
+exp_cells <- WhichCells(combined, expression = group == "Experiment")
+
+ctl_subset <- subset(combined, cells = ctl_cells)
+exp_subset <- subset(combined, cells = exp_cells)
+  
+  
+  
+  # 定义双细胞检测函数
+  detect_doublets <- function(seurat_obj, sample_name) {
+    cat("正在处理样本:", sample_name, "\n")
+    
+    # 标准化和寻找高变基因
+    seurat_obj <- NormalizeData(seurat_obj, verbose = FALSE)
+    seurat_obj <- FindVariableFeatures(seurat_obj, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+    seurat_obj <- ScaleData(seurat_obj, verbose = FALSE)
+    
+    # PCA
+    seurat_obj <- RunPCA(seurat_obj, verbose = FALSE)
+    
+    # 确定PC数量
+    pct <- seurat_obj[["pca"]]@stdev / sum(seurat_obj[["pca"]]@stdev) * 100
+    cumu <- cumsum(pct)
+    co1 <- which(cumu > 90 & pct < 5)[1]
+    co2 <- sort(which((pct[1:length(pct) - 1] - pct[2:length(pct)]) > 0.1), decreasing = T)[1] + 1
+    pcs <- min(co1, co2, 50)
+    cat("使用PC数量:", pcs, "\n")
+    
+    # UMAP和聚类（DoubletFinder需要）
+    seurat_obj <- RunUMAP(seurat_obj, dims = 1:pcs, verbose = FALSE)
+    seurat_obj <- FindNeighbors(seurat_obj, dims = 1:pcs, verbose = FALSE)
+    seurat_obj <- FindClusters(seurat_obj, resolution = 0.5, verbose = FALSE)
+    
+    # 预估双细胞比例（根据细胞数量）
+    cell_count <- ncol(seurat_obj)
+    if (cell_count <= 1000) {
+      doublet_rate <- 0.008
+    } else if (cell_count <= 5000) {
+      doublet_rate <- 0.016
+    } else if (cell_count <= 10000) {
+      doublet_rate <- 0.023
+    } else {
+      doublet_rate <- 0.031
+    }
+    
+    cat("预估双细胞比例:", doublet_rate, "\n")
+    
+    # 尝试不同版本的DoubletFinder函数
+    tryCatch({
+      # 尝试新版本的函数
+      sweep.res.list <- paramSweep(seurat_obj, PCs = 1:pcs, sct = FALSE)
+    }, error = function(e) {
+      tryCatch({
+        # 尝试旧版本的函数
+        sweep.res.list <- paramSweep_v3(seurat_obj, PCs = 1:pcs, sct = FALSE)
+      }, error = function(e2) {
+        stop("DoubletFinder版本不兼容，请检查安装的版本")
+      })
+    })
+    
+    sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+    bcmvn <- find.pK(sweep.stats)
+    
+    # 选择最优pK
+    optimal_pk <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+    cat("最优pK值:", optimal_pk, "\n")
+  
+  
+    # 计算同质双细胞数量
+    annotations <- seurat_obj@meta.data$seurat_clusters
+    homotypic.prop <- modelHomotypic(annotations)
+    nExp_poi <- round(doublet_rate * ncol(seurat_obj))
+    nExp_poi.adj <- round(nExp_poi * (1 - homotypic.prop))
+    
+    cat("预期双细胞数量:", nExp_poi, "\n")
+    cat("调整后双细胞数量:", nExp_poi.adj, "\n")
+    
+    # 运行DoubletFinder - 尝试不同版本
+    tryCatch({
+      # 尝试新版本
+      seurat_obj <- doubletFinder(seurat_obj, 
+                                  PCs = 1:pcs, 
+                                  pN = 0.25, 
+                                  pK = optimal_pk, 
+                                  nExp = nExp_poi.adj,
+                                  reuse.pANN = FALSE, 
+                                  sct = FALSE)
+    }, error = function(e) {
+      # 尝试旧版本
+      seurat_obj <- doubletFinder_v3(seurat_obj, 
+                                     PCs = 1:pcs, 
+                                     pN = 0.25, 
+                                     pK = optimal_pk, 
+                                     nExp = nExp_poi.adj,
+                                     reuse.pANN = FALSE, 
+                                     sct = FALSE)
+    })
+    
+    # 获取doublet分类结果列名
+    doublet_col <- grep("DF.classifications", colnames(seurat_obj@meta.data), value = TRUE)
+    pann_col <- grep("pANN", colnames(seurat_obj@meta.data), value = TRUE)
+    
+    # 重命名列以便后续处理
+    seurat_obj@meta.data$doublet_classification <- seurat_obj@meta.data[[doublet_col]]
+    seurat_obj@meta.data$doublet_score <- seurat_obj@meta.data[[pann_col]]
+    
+    cat("双细胞检测完成 -", sample_name, "\n")
+    cat("检测到的双细胞数量:", sum(seurat_obj$doublet_classification == "Doublet"), "\n\n")
+    
+    return(seurat_obj)
+  }
+  
+
+# 对两个样本分别进行双细胞检测
+ctl_doublets <- detect_doublets(ctl_subset, "Control")
+exp_doublets <- detect_doublets(exp_subset, "Experiment")
+
+# 合并双细胞检测结果
+# 提取需要的元数据列
+ctl_meta <- ctl_doublets@meta.data[, c("doublet_classification", "doublet_score"), drop = FALSE]
+exp_meta <- exp_doublets@meta.data[, c("doublet_classification", "doublet_score"), drop = FALSE]
+
+# 将双细胞信息添加回原始combined对象
+combined$doublet_classification <- NA
+combined$doublet_score <- NA
+
+combined@meta.data[rownames(ctl_meta), "doublet_classification"] <- ctl_meta$doublet_classification
+combined@meta.data[rownames(ctl_meta), "doublet_score"] <- ctl_meta$doublet_score
+combined@meta.data[rownames(exp_meta), "doublet_classification"] <- exp_meta$doublet_classification
+combined@meta.data[rownames(exp_meta), "doublet_score"] <- exp_meta$doublet_score
+
+# 统计双细胞检测结果
+doublet_summary <- table(combined$group, combined$doublet_classification)
+print("双细胞检测结果统计:")
+print(doublet_summary)
+
+# 可视化双细胞检测结果
+p_doublet_summary <- combined@meta.data %>%
+  count(group, doublet_classification) %>%
+  ggplot(aes(x = group, y = n, fill = doublet_classification)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "双细胞检测结果", x = "样本组", y = "细胞数量", fill = "分类") +
+  theme_bw()
+
+print(p_doublet_summary)
+ggsave("doublet_detection_summary.pdf", p_doublet_summary, width = 8, height = 5)
+
+# 去除双细胞
+print(paste("去除双细胞前细胞数:", ncol(combined)))
+combined_filtered <- subset(combined, subset = doublet_classification == "Singlet")
+print(paste("去除双细胞后细胞数:", ncol(combined_filtered)))
+table(combined_filtered$group)
+
+# 使用过滤后的数据继续分析
+combined <- combined_filtered
+
+# ===========================================
+# 继续原有的分析流程
+# ===========================================
+
+# SCTransform（更先进，整合标准化、缩放和寻找高变基因）
+combined <- SCTransform(combined, 
+                        vars.to.regress = c("percent.mt", "nCount_RNA"),
+                        verbose = FALSE)
+
+# PCA降维
+combined <- RunPCA(combined, features = VariableFeatures(object = combined))
+
+# 查看PCA结果
+print(combined[["pca"]], dims = 1:5, nfeatures = 5)
+VizDimLoadings(combined, dims = 1:2, reduction = "pca")
+
+# 确定使用的PC数量
+ElbowPlot(combined, ndims = 30)
+ggsave("ElbowPlot.pdf", width = 8, height = 6)
+
+# RunHarmony 使用 PCA 的结果进行批次校正
+combined <- RunHarmony(combined, 
+                       group.by = "group",
+                       reduction.use = "pca",    
+                       dims = 1:30,              # 注意是 dims 而不是 dims.use
+                       plot_convergence = TRUE)
+
+set.seed(1234)
+# 使用 harmony 结果进行聚类
+combined <- FindNeighbors(combined, reduction = "harmony", dims = 1:30)
+combined <- FindClusters(combined, resolution = c(0.3, 0.5, 0.8, 1))
+
+# 选择合适的resolution
+Idents(combined) <- "SCT_snn_res.0.3"
+
+# 可视化比较批次校正效果
+# 比较 PCA 和 Harmony
+p4.1 <- DimPlot(combined, reduction = "pca", group.by = "group") + 
+  ggtitle("Original PCA")
+p4.2 <- DimPlot(combined, reduction = "harmony", group.by = "group") + 
+  ggtitle("After Harmony")
+
+# 比较 UMAP（基于不同的降维）
+combined <- RunUMAP(combined, reduction = "pca", dims = 1:30, 
+                    reduction.name = "umap_pca", reduction.key = "UMAPPCA_")
+combined <- RunUMAP(combined, reduction = "harmony", dims = 1:30,
+                    reduction.name = "umap_harmony", reduction.key = "UMAPHARMONY_")
+
+p5 <- DimPlot(combined, reduction = "umap_pca", group.by = "group") + 
+  ggtitle("UMAP (PCA-based)")
+p6 <- DimPlot(combined, reduction = "umap_harmony", group.by = "group") + 
+  ggtitle("UMAP (Harmony-based)")
+
+# 显示所有图
+print((p4.1 + p4.2) / (p5 + p6))
+ggsave("Harmony_comparison.pdf", width = 12, height = 10)
+
+# 按聚类着色
+p7 <- DimPlot(combined, reduction = "umap_harmony", label = TRUE, label.size = 4)
+
+# 按实验组着色
+p8 <- DimPlot(combined, reduction = "umap_harmony", group.by = "group")
+
+print(p7 + p8)
+ggsave("UMAP_clusters.pdf", plot = p7 + p8, width = 16, height = 6)
+
+# 准备 FindMarkers 分析
+combined <- PrepSCTFindMarkers(combined)  # 重要！准备 SCT 数据用于差异分析
+
+# 现在可以安全地使用 SCT assay 寻找 markers
+all_markers <- FindAllMarkers(combined,
+                              assay = "SCT",  # 明确指定使用 SCT
+                              only.pos = TRUE,
+                              min.pct = 0.25,
+                              logfc.threshold = 0.25,
+                              recorrect_umi = FALSE)  # SCT 特有参数
+
+# 每个聚类取top10基因
+top10 <- all_markers %>% 
+  group_by(cluster) %>% 
+  top_n(n = 10, wt = avg_log2FC)
+
+# 热图展示
+DoHeatmap(combined, features = top10$gene) + NoLegend()
+ggsave("Heatmap_top10_markers.pdf", width = 12, height = 10)
+
+## ==== 0. 小工具（可保留，但人类数据不需要大小写混合）====
+present_genes <- rownames(combined)
+gi <- function(vec) {
+  u <- unique(vec)
+  u[ u %in% present_genes ]
+}
+
+## ==== 1. 融合后的"粗注释" marker 面板（仅人类基因符号） ====
+# 我必须要强调要基于自己的组织来使用marker，一般建议参考高分权威论文的marker gene
+marker_panels <- list(
+  Endothelial_arterial = c("EFNB2","GJA5","DLL4"),
+  Endothelial_venous   = c("NR2F2","EPHB4"),
+  
+  MSC                   = c("LEPR","CXCL12","MCAM"),
+  Fibroblast            = c("DCN","LUM","COL1A2"),
+  Pericyte              = c("RGS5","PDGFRB","KCNJ8"),
+  
+  Epithelial            = c("KRT5","KRT8","EPCAM"),
+  
+  T_cell                = c("TRAC","CD3D","CD3E"),
+  B_cell                = c("MS4A1","CD79A","PAX5"),
+  Plasma_cell           = c("MZB1","SDC1","XBP1"),
+  NK_cell               = c("NKG7","GNLY","PRF1"),
+  Neutrophil            = c("FCGR3B","CSF3R","S100A8","S100A9"),
+  Monocyte_Macrophage   = c("LYZ","MS4A7","LST1"),
+  Dendritic             = c("ITGAX","CLEC9A","CCR7"),
+  
+  Mast_cell             = c("TPSAB1","TPSB2","CPA3"),
+  MDSC                  = c("LTF","OLR1","LCN2")
+)
+
+## ==== 2. 打分 ====
+for (nm in names(marker_panels)) {
+  feats <- gi(marker_panels[[nm]])
+  if (length(feats) >= 2) {
+    combined <- AddModuleScore(combined, features = list(feats), name = paste0(nm, "_score"))
+  } else {
+    combined@meta.data[[paste0(nm, "_score1")]] <- NA_real_
+  }
+}
+
+## ==== 3. 自动挑选最高分作为粗注释 ====
+score_cols <- grep("_score1$", colnames(combined@meta.data), value = TRUE)
+score_mat  <- as.matrix(combined@meta.data[, score_cols, drop = FALSE])
+colnames(score_mat) <- sub("_score1$", "", colnames(score_mat))
+combined$major_type  <- colnames(score_mat)[ max.col(score_mat, ties.method = "first") ]
+
+## ==== 4. 可视化 ====
+p_dot <- DotPlot(combined, features = unique(unlist(lapply(marker_panels, gi))),
+                 group.by = "major_type", cols = c("lightgrey", "red")) + RotatedAxis()
+
+p_umap <- DimPlot(combined, reduction = "umap_harmony", group.by = "major_type", label = TRUE)
+print(p_umap)
+print(p_dot)
+
+ggsave("MajorType_UMAP.pdf", p_umap, width = 8, height = 6)
+ggsave("MajorType_DotPlot.pdf", p_dot, width = 12, height = 8)
+
+## 1) 总体：各类型细胞数量
+tbl_total <- combined@meta.data %>%
+  count(major_type, name = "n") %>%
+  arrange(desc(n))
+print(tbl_total)
+
+## 2) 分组：各类型在 Control/Experiment 内的数量与占比
+tbl_by_group <- combined@meta.data %>%
+  count(group, major_type, name = "n") %>%
+  group_by(group) %>%
+  mutate(pct = 100 * n / sum(n)) %>%
+  arrange(group, desc(n))
+print(tbl_by_group)
+
+## 3) 保存表格
+write.csv(tbl_total,    "counts_major_type_total.csv",    row.names = FALSE)
+write.csv(tbl_by_group, "counts_major_type_by_group.csv", row.names = FALSE)
+
+## 4) 可视化：按组的堆叠条形图（数量）
+p_counts <- ggplot(tbl_by_group, aes(x = group, y = n, fill = major_type)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "Cell count", fill = "Major type",
+       title = "Cell counts by major type and group") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5))
+print(p_counts)
+ggsave("counts_major_type_by_group.pdf", p_counts, width = 8, height = 5)
+
+## 5) 可视化：按组的堆叠条形图（百分比）
+p_pct <- ggplot(tbl_by_group, aes(x = group, y = pct, fill = major_type)) +
+  geom_bar(stat = "identity") +
+  labs(x = NULL, y = "Percent (%)", fill = "Major type",
+       title = "Cell composition by major type and group") +
+  theme_bw()
+print(p_pct)
+ggsave("composition_major_type_by_group.pdf", p_pct, width = 8, height = 5)
+
+p9 <- FeaturePlot(combined,
+                  features = "SFRP2",
+                  reduction = "umap_harmony",
+                  split.by = "group",     # 分组显示
+                  cols = c("lightgrey","red"),
+                  pt.size = 0.3,
+                  order = TRUE)
+print(p9)
+ggsave("FeaturePlot_umap_harmony_SFRP2.pdf", p9, width = 12, height = 5)
+
+#save.image("1.RData")
